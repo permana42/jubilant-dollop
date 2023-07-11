@@ -1,0 +1,195 @@
+#!/bin/bash
+
+IP_ADDR="10.10.10.120"
+
+#take care of selinx and the firewall
+setsebool -P httpd_read_user_content 1
+
+yum install -y policycoreutils-python
+
+semanage port -m -t http_port_t -p tcp 8000
+semanage port -a -t http_port_t -p tcp 8001
+
+firewall-cmd --add-service http --permanent
+firewall-cmd --add-port 8000/tcp --permanent
+firewall-cmd --reload
+
+## Most people wont need this
+cat > /etc/yum.repos.d/extras.repo << 'EOF'
+[extras]
+name=Extras
+baseurl=http://mirror.centos.org/centos/7/extras/x86_64/
+gpgcheck=0
+EOF
+
+yum install -y centos-release-scl
+
+yum install -y gcc autoconf flex bison libjpeg-turbo-devel freetype-devel zlib-devel zeromq3-devel gdbm-devel ncurses-devel automake libtool libffi-devel curl git tmux libxml2-devel libxslt-devel wget openssl-devel gcc-c++
+
+#PostgreSQL 9.5 (pulls in scl-utils as a dep)
+yum install -y rh-postgresql95 rh-postgresql95-postgresql-contrib.x86_64 rh-postgresql95-postgresql-devel.x86_64
+
+scl enable rh-postgresql95 "postgresql-setup --initdb --unit rh-postgresql95-postgresql"
+
+systemctl start rh-postgresql95-postgresql.service
+systemctl enable rh-postgresql95-postgresql.service
+
+
+#PostgreSQL initDB setting
+cd /home
+scl enable rh-postgresql95 'su postgres -c "createuser taiga"'
+scl enable rh-postgresql95 'su postgres -c "createdb taiga -O taiga"'
+
+#Python 3.5.2
+yum install rh-python35 -y
+
+#taiga add
+adduser taiga
+
+#taiga-back
+cd /home/taiga
+git clone https://github.com/taigaio/taiga-back.git taiga-back
+cd taiga-back/
+git checkout stable
+
+scl enable rh-postgresql95 rh-python35 "pip3.5 install --upgrade pip"
+scl enable rh-postgresql95 rh-python35 "pip3.5 install -r requirements.txt"
+
+chown -R taiga:taiga /home/taiga/
+
+scl enable rh-postgresql95 rh-python35 'su taiga -c "python3.5 manage.py migrate --noinput"'
+scl enable rh-postgresql95 rh-python35 'su taiga -c "python3.5 manage.py loaddata initial_user"'
+scl enable rh-postgresql95 rh-python35 'su taiga -c "python3.5 manage.py loaddata initial_project_templates"'
+# scl enable rh-postgresql95 rh-python35 'su taiga -c "python3.5 manage.py loaddata initial_role"'
+scl enable rh-postgresql95 rh-python35 'su taiga -c "python3.5 manage.py compilemessages"'
+scl enable rh-postgresql95 rh-python35 'su taiga -c "python3.5 manage.py collectstatic --noinput"'
+
+cat >> /home/taiga/taiga-back/settings/local.py << EOF
+from .development import *
+from .common import *
+MEDIA_URL = "http://${IP_ADDR}/media/"
+STATIC_URL = "http://${IP_ADDR}/static/"
+ADMIN_MEDIA_PREFIX = "http://${IP_ADDR}/static/admin/"
+SITES["front"]["scheme"] = "http"
+SITES["front"]["domain"] = "${IP_ADDR}"
+SECRET_KEY = "theveryultratopsecretkey"
+DEBUG = False
+TEMPLATE_DEBUG = False
+PUBLIC_REGISTER_ENABLED = True
+DEFAULT_FROM_EMAIL = "no-reply@example.com"
+SERVER_EMAIL = DEFAULT_FROM_EMAIL
+EOF
+
+#taiga-front
+cd /home/taiga
+git clone https://github.com/taigaio/taiga-front-dist.git taiga-front-dist
+cd taiga-front-dist/
+git checkout stable
+cd dist/
+sed -e "s%http://localhost:8000%%" conf.example.json > conf.json
+
+#circus
+cd /home/taiga
+
+yum install -y epel-release
+yum install -y nginx
+
+cat > /etc/nginx/nginx.conf << 'EOF'
+# For more information on configuration, see:
+#   * Official English Documentation: http://nginx.org/en/docs/
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log;
+pid /run/nginx.pid;
+# Load dynamic modules. See /usr/share/nginx/README.dynamic.
+include /usr/share/nginx/modules/*.conf;
+events {
+    worker_connections 1024;
+}
+http {
+    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for"';
+    access_log  /var/log/nginx/access.log  main;
+    sendfile            on;
+    tcp_nopush          on;
+    tcp_nodelay         on;
+    keepalive_timeout   65;
+    types_hash_max_size 2048;
+    include             /etc/nginx/mime.types;
+    default_type        application/octet-stream;
+    include /etc/nginx/conf.d/*.conf;
+}
+EOF
+
+cat > /etc/nginx/conf.d/taiga.conf <<'EOF'
+server {
+    listen 80 default_server;
+    listen 8000 default_server;
+    server_name _;
+    large_client_header_buffers 4 32k;
+    client_max_body_size 50M;
+    charset utf-8;
+    access_log /var/log/nginx/taiga-nginx.access.log;
+    error_log /var/log/nginx/taiga-nginx.error.log;
+    # Frontend
+    location / {
+        root /home/taiga/taiga-front-dist/dist/;
+        try_files $uri $uri/ /index.html;
+    }
+    # Backend
+    location /api {
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Scheme $scheme;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_pass http://127.0.0.1:8001/api;
+        proxy_redirect off;
+    }
+    # Django admin access (/admin/)
+    location /admin {
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Scheme $scheme;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_pass http://127.0.0.1:8001$request_uri;
+        proxy_redirect off;
+   }
+    # Static files
+    location /static {
+        alias /home/taiga/taiga-back/static;
+    }
+    # Media files
+    location /media {
+        alias /home/taiga/taiga-back/media;
+    }
+}
+EOF
+ 
+
+cat > /etc/systemd/system/taiga.service <<EOF
+[Unit]
+Description=Taiga Service
+After=network.target
+[Service]
+Type=simple
+User=taiga
+WorkingDirectory=/home/taiga/taiga-back
+ExecStart=/usr/bin/scl enable rh-postgresql95 rh-python35 -- /opt/rh/rh-python35/root/usr/bin/python3.5 /home/taiga/taiga-back/manage.py runserver 127.0.0.1:8001
+Restart=on-abort
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# final steps 
+
+chown -R taiga:taiga /home/taiga/
+chmod o+x /home/taiga/
+
+# now some systmectl stuff
+systemctl daemon-reload
+
+systemctl restart nginx taiga
+systemctl enable nginx taiga
